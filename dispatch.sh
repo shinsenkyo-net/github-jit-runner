@@ -47,12 +47,13 @@ token() { # owner/name: print an installation token for that one repository
     sed -n 2p "$cache"
     return
   fi
-  inst=$(app_call GET "/repos/$1/installation" | jq -er .id)
+  # Explicit returns: callers use $(token ...) in conditions, where set -e is off.
+  inst=$(app_call GET "/repos/$1/installation" | jq -er .id) || return 1
   body=$(jq -cn --arg r "${1#*/}" \
-    '{repositories: [$r], permissions: {administration: "write", actions: "read"}}')
+    '{repositories: [$r], permissions: {administration: "write", actions: "read"}}') || return 1
   app_call POST "/app/installations/$inst/access_tokens" "$body" |
-    jq -er '(.expires_at | fromdateiso8601), .token' >"$cache.tmp"
-  mv "$cache.tmp" "$cache"
+    jq -er '(.expires_at | fromdateiso8601), .token' >"$cache.tmp" || return 1
+  mv "$cache.tmp" "$cache" || return 1
   sed -n 2p "$cache"
 }
 
