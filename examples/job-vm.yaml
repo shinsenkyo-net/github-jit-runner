@@ -1,0 +1,50 @@
+# Suspended Job template for the VM runner (vm/). Needs /dev/kvm exposed as
+# the extended resource squat.ai/kvm, e.g. by squat/generic-device-plugin.
+# Pin the image by digest.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: github-jit-runner
+  namespace: github-runners
+spec:
+  suspend: true
+  backoffLimit: 0
+  activeDeadlineSeconds: 5400
+  ttlSecondsAfterFinished: 600
+  podReplacementPolicy: Failed
+  template:
+    spec:
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 60
+      nodeSelector:
+        kubernetes.io/hostname: worker-1
+        kubernetes.io/arch: amd64
+      serviceAccountName: github-jit-runner
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: runner
+          image: ghcr.io/shinsenkyo-net/github-jit-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          stdin: true
+          stdinOnce: true
+          tty: false
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: "2", memory: 17Gi, ephemeral-storage: 10Gi}
+            limits:
+              cpu: "6"
+              memory: 20Gi
+              ephemeral-storage: 50Gi
+              squat.ai/kvm: "1"
+          volumeMounts:
+            - {name: vm, mountPath: /vm}
+      volumes:
+        - name: vm
+          emptyDir: {sizeLimit: 48Gi}

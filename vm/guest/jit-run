@@ -1,0 +1,57 @@
+#!/bin/bash
+# Guest side of the VM runner: prepare scratch, start Docker, read the JIT
+# registration from the virtio-serial port, run exactly one job, report the
+# result to QEMU through isa-debug-exit (port 0xf4) and power off.
+set -uo pipefail
+log() { echo "jit: $*"; }
+
+report() {
+  # QEMU exits with (value << 1) | 1: 0 -> 1 (success), 1 -> 3 (failure).
+  printf "\\x$(printf %02x "$1")" | dd of=/dev/port bs=1 seek=244 count=1 status=none
+  systemctl poweroff --force --force
+}
+
+main() {
+  set -e
+  mkfs.ext4 -q -F -E lazy_itable_init=1,nodiscard /dev/vdb
+  mount -o discard /dev/vdb /mnt/scratch
+  install -d /mnt/scratch/docker /var/lib/docker
+  install -d -o runner -g runner /mnt/scratch/work
+  mount --bind /mnt/scratch/docker /var/lib/docker
+  mount --bind /mnt/scratch/work /opt/runner/_work
+  log "scratch ready ($(df -h --output=size /mnt/scratch | tail -1 | tr -d ' '))"
+
+  systemctl start docker
+  for _ in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 1; done
+  docker info >/dev/null
+  log "docker ready"
+
+  if curl --silent --fail --max-time 20 https://api.github.com/zen >/dev/null; then
+    log "network ok"
+  else
+    log "network check failed"
+  fi
+
+  port=/dev/virtio-ports/jit.config
+  for _ in $(seq 60); do [ -e "$port" ] && break; sleep 1; done
+  IFS= read -r ACTIONS_RUNNER_INPUT_JITCONFIG <"$port"
+  [ -n "$ACTIONS_RUNNER_INPUT_JITCONFIG" ]
+  log "registration received"
+
+  export ACTIONS_RUNNER_INPUT_JITCONFIG \
+    RUNNER_TOOL_CACHE=/opt/hostedtoolcache AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache
+  cd /opt/runner
+  runuser -u runner \
+    -w ACTIONS_RUNNER_INPUT_JITCONFIG,RUNNER_TOOL_CACHE,AGENT_TOOLSDIRECTORY \
+    -- ./run.sh
+}
+
+# Not `if (main)`: errexit is ignored inside a tested command, even a subshell.
+( main )
+if [ $? -eq 0 ]; then
+  log "runner exited cleanly"
+  report 0
+else
+  log "runner failed"
+  report 1
+fi

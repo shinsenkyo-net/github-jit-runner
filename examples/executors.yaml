@@ -1,0 +1,18 @@
+# Executor profiles for launch.sh. Each profile is the boundary the
+# Job template must match exactly; the launcher refuses anything else.
+# `template` is relative to this file.
+executors:
+  vm-node:
+    node: worker-1                       # kubernetes.io/hostname
+    namespace: github-runners
+    template: job-vm.yaml
+    pod_policy: github-jit-pods          # ValidatingAdmissionPolicy names that
+    binding_policy: github-jit-bindings  # must exist (checked in preflight)
+    tolerations: []
+    dns_policy: null                     # or Default, if CoreDNS is unreachable
+    limits:
+      cpu: "6"
+      memory: 20Gi
+      ephemeral-storage: 50Gi
+      squat.ai/kvm: "1"
+    unprivileged: true                   # VM runner: non-root, no capabilities

@@ -1,0 +1,14 @@
+[Unit]
+Description=One GitHub Actions JIT job, then power off
+Wants=network-online.target
+After=network-online.target systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/jit-run
+StandardOutput=journal+console
+StandardError=journal+console
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target

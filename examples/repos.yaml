@@ -1,0 +1,13 @@
+# Repository allowlist for launch.sh. Only listed repositories and
+# workflows can run; every run still needs an explicit --run-id and full --sha.
+# Runs from forks are always refused; public repositories need `public: true`.
+repos:
+  example-org/example-repo:
+    label_prefix: jit            # runs-on label: jit-<run_id>-<attempt>
+    workflows:
+      - .github/workflows/ci.yml
+    publish:                     # optional: branch/event-pinned workflows
+      - path: .github/workflows/release.yml
+        branches: [main]
+        events: [push, workflow_dispatch]
+    public: false
