@@ -202,7 +202,7 @@ job_pod() { # prints the owned pod JSON, or nothing
 }
 
 OWNER=$(openssl rand -hex 12)
-JOB_UID= RUNNER_ID= LOCK_UID= SAFE_TO_UNLOCK=true
+JOB_UID= RUNNER_ID= LOCK_UID= ATTACH_PID= SAFE_TO_UNLOCK=true
 
 # Delete this attempt's Job (and wait for its pod) and any leftover runner.
 cleanup_job() {
@@ -225,6 +225,7 @@ cleanup_job() {
 on_exit() {
   local code=$?
   trap - EXIT
+  [[ -z $ATTACH_PID ]] || kill "$ATTACH_PID" 2>/dev/null || true
   [[ -z $JOB_UID && -z $RUNNER_ID ]] || cleanup_job || true
   if [[ -n $LOCK_UID ]]; then
     if $SAFE_TO_UNLOCK; then
@@ -265,14 +266,19 @@ execute_job() {
   # The registration exists only in this variable and the attach stdin pipe.
   reg=$(gh api --method POST "repos/$REPO/actions/runners/generate-jitconfig" --input - <<<"$payload")
   RUNNER_ID=$(printf '%s' "$reg" | jq -r .runner.id)
+  # The attach streams the console until the job ends. In the background with
+  # `wait`, so TERM (dispatcher shutdown) runs on_exit now, not after the job.
   # Never retry an interrupted attach with this credential.
-  if ! printf '%s\n' "$reg" | jq -r .encoded_jit_config |
-      kubectl ${KARGS[@]+"${KARGS[@]}"} --request-timeout=0 \
-        attach -i "$pod_name" -n "$NS" -c runner; then
-    reg=
+  (printf '%s\n' "$reg" | jq -r .encoded_jit_config |
+    kubectl ${KARGS[@]+"${KARGS[@]}"} --request-timeout=0 \
+      attach -i "$pod_name" -n "$NS" -c runner) &
+  ATTACH_PID=$!
+  reg=
+  if ! wait "$ATTACH_PID"; then
+    ATTACH_PID=
     die "$NODE attach failed; inspect cleanup before retrying"
   fi
-  reg=
+  ATTACH_PID=
   while ((SECONDS < DEADLINE)); do
     pod=$(job_pod)
     phase=$(jq -r '.status.phase // empty' <<<"${pod:-null}")
@@ -308,7 +314,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 LOCK_UID=$(kc create configmap "$LOCK" -n "$NS" \
   --from-literal=owner="$OWNER" --from-literal=repo="$REPO" --from-literal=run="$RUN_ID" \
-  --from-literal=sha="$SHA" --from-literal=attempt="$ATTEMPT" -o jsonpath='{.metadata.uid}')
+  --from-literal=sha="$SHA" --from-literal=attempt="$ATTEMPT" \
+  --from-literal=holder="${GITHUB_JIT_HOLDER:-manual/$(hostname)}" -o jsonpath='{.metadata.uid}')
 
 # --- supervise -----------------------------------------------------------------
 
@@ -324,12 +331,15 @@ while ((SECONDS < DEADLINE)); do
   fi
   verdict=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100" |
     jq -r --arg label "$LABEL" --argjson sup "$SUPPORTED" '
-      [.jobs[] | select(.status == "queued")] as $queued
+      [.jobs[] | select(.labels | index($label))] as $ours
+      | [.jobs[] | select(.status == "queued")] as $queued
       | ($queued | map(select(.labels | index($label)))) as $mine
       | if ($mine | length) > 0 then
           if ($mine | all((.labels - $sup) | length == 0)) then "run" else "unsupported" end
+        elif ($ours | length) > 0 and ($ours | all(.status == "completed")) then
+          if ($ours | all(.conclusion == "success" or .conclusion == "skipped")) then "done" else "failed" end
         elif ($queued | length) > 0 and ($queued | all((.labels | index("self-hosted")) == null))
-             and (.jobs | all((.labels | index($label)) == null))
+             and ($ours | length) == 0
           then "hosted"
         else "wait" end')
   case $verdict in
@@ -338,6 +348,9 @@ while ((SECONDS < DEADLINE)); do
       # for the same run/attempt.
       [[ -z $(runner_ids_with_label "$LABEL") ]] || die "a runner already advertises this attempt; inspect it"
       execute_job ;;
+    # Our jobs are finished; do not hold the executor while hosted jobs run.
+    done) echo "Jobs for $LABEL completed: success"; exit 0 ;;
+    failed) echo "Jobs for $LABEL completed: not all succeeded"; exit 1 ;;
     unsupported) die "queued job requires labels this executor cannot supply" ;;
     hosted) die "workflow still targets hosted runners; migrate it first" ;;
     *) sleep 5 ;;

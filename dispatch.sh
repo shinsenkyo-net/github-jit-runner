@@ -13,8 +13,10 @@
 #
 # A job is picked up when it is queued with the label <label_prefix>-<run_id>-<attempt>
 # in an allowlisted repository; launch.sh then applies every check (private repo,
-# same-repo head, allowlisted workflow, SHA). One run at a time. A run/attempt is
-# launched at most once: if it fails, re-run it in GitHub (a new attempt).
+# same-repo head, allowlisted workflow, SHA). One run at a time. A failed launch is
+# retried on later polls while its job is still queued, at most 3 times per
+# run/attempt. A lock left by an earlier launch of this dispatcher (crash, kill)
+# is cleared at start and after failures, once that launch's Job is gone.
 # Outbound polling only; nothing listens. Needs bash, curl, gh, kubectl, jq, yq, openssl.
 set -euo pipefail
 umask 077
@@ -80,6 +82,9 @@ done
   die "needs --executors --allowlist --executor --app DIR"
 [[ $INTERVAL =~ ^[1-9][0-9]*$ ]] || die "--interval must be positive"
 export GITHUB_APP_DIR=$APP
+export GITHUB_JIT_HOLDER="dispatcher/${HOSTNAME:-$(hostname)}"
+NS=$(yq -r ".executors[\"$EXECUTOR\"].namespace" "$EXECUTORS")
+[[ -n $NS && $NS != null ]] || die "executor $EXECUTOR has no namespace"
 # kubectl drops its in-cluster config once any flag (launch.sh: --request-timeout)
 # is set, so point it at the service account explicitly. The token stays in its file.
 sa=/var/run/secrets/kubernetes.io/serviceaccount
@@ -97,12 +102,37 @@ fi
 template=()
 [[ -z $TEMPLATE ]] || template=(--template "$TEMPLATE")
 
-seen=$(mktemp)         # run/attempt keys already launched, and repos already reported
+seen=$(mktemp)         # repos already reported as having no token
+fails=$(mktemp)        # one line per failed launch: owner/name/run/attempt
 child=
 # As PID 1 bash ignores SIGTERM unless trapped: pass it on so launch.sh cleans up.
 trap '[[ -z $child ]] || { kill -TERM "$child" 2>/dev/null; wait "$child" || true; }; exit 143' TERM INT
-trap 'rm -f "$seen"' EXIT
+trap 'rm -f "$seen" "$fails"' EXIT
 once() { grep -qxF "$1" "$seen" && return 1; echo "$1" >>"$seen"; }
+
+kd() { kubectl --request-timeout=20s "$@"; }
+
+# A lock held by this dispatcher (an earlier process, or a launch.sh that could not
+# confirm its cleanup): delete that launch's Job and pods, then the lock by UID.
+# Called only while no launch is running. Locks of manual launches are left alone.
+clear_stale_lock() {
+  local lock holder owner uid pods
+  lock=$(kd get configmap github-jit-lock -n "$NS" -o json --ignore-not-found) || return 1
+  [[ -n $lock ]] || return 0
+  holder=$(jq -r '.data.holder // "unknown"' <<<"$lock")
+  if [[ $holder != dispatcher/* ]]; then
+    log "lock held by $holder; leaving it"
+    return 1
+  fi
+  owner=$(jq -r .data.owner <<<"$lock")
+  uid=$(jq -r .metadata.uid <<<"$lock")
+  kd delete jobs -n "$NS" -l "github-jit/owner=$owner" --cascade=foreground --wait --timeout=150s >/dev/null || return 1
+  pods=$(kd get pods -n "$NS" -l "github-jit/owner=$owner" -o name) || return 1
+  [[ -z $pods ]] || kd wait --for=delete $pods -n "$NS" --timeout=150s >/dev/null || return 1
+  jq -n --arg uid "$uid" '{apiVersion: "v1", kind: "DeleteOptions", preconditions: {uid: $uid}}' |
+    kd delete --raw "/api/v1/namespaces/$NS/configmaps/github-jit-lock" -f - >/dev/null || return 1
+  log "cleared a stale lock (run $(jq -r .data.run <<<"$lock"), holder $holder)"
+}
 
 # Prints "<run_id> <attempt> <sha>" for runs of $repo with a queued job labelled for us.
 queued_runs() { # repo prefix
@@ -121,6 +151,7 @@ queued_runs() { # repo prefix
 }
 
 log "dispatching for executor $EXECUTOR every ${INTERVAL}s"
+clear_stale_lock || true
 while true; do
   for repo in $(yq -r '.repos | keys | .[]' "$ALLOWLIST"); do
     prefix=$(yq -r ".repos[\"$repo\"].label_prefix // \"jit\"" "$ALLOWLIST")
@@ -134,7 +165,10 @@ while true; do
       continue
     fi
     while read -r id attempt sha; do
-      [[ -n $id ]] && once "$repo/$id/$attempt" || continue
+      [[ -n $id ]] || continue
+      key=$repo/$id/$attempt
+      tries=$(grep -cxF "$key" "$fails" || true)
+      ((tries < 3)) || continue
       log "$repo run $id/$attempt ($sha): launching"
       GH_TOKEN_COMMAND="$here/dispatch.sh token $repo" \
         "$here/launch.sh" run --executors "$EXECUTORS" --allowlist "$ALLOWLIST" \
@@ -144,6 +178,11 @@ while true; do
       code=0; wait "$child" || code=$?
       child=
       log "$repo run $id/$attempt: launch exited $code"
+      if ((code != 0)); then
+        echo "$key" >>"$fails"
+        clear_stale_lock || true
+        ((tries < 2)) || log "$repo run $id/$attempt: gave up after 3 launches; re-run it in GitHub"
+      fi
     done <<<"$found"
   done
   unset GH_TOKEN
