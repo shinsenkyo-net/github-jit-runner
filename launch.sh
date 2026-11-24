@@ -4,7 +4,7 @@
 #   ./launch.sh run \
 #     --executors EXECUTORS.yaml --allowlist REPOS.yaml --executor NAME \
 #     --repo OWNER/NAME --run-id ID --sha FULL_HEAD_SHA \
-#     --kubeconfig KUBECONFIG --context CONTEXT [--minutes 90] [--runner-image IMG@sha256:...]
+#     [--kubeconfig KUBECONFIG --context CONTEXT] [--minutes 90] [--runner-image IMG@sha256:...]
 #
 #   ./launch.sh check --executors EXECUTORS.yaml --executor NAME [--template FILE]
 #     Offline: validate a Job template against its executor profile, print the Job.
@@ -13,8 +13,9 @@
 # it against the allowlist, creates one Job from a reviewed template, waits for
 # the pod on the expected node, then mints a single-job JIT registration with
 # `gh` and passes it only through non-TTY stdin: never argv, env, files or logs.
-# No controller, App key, kubeconfig mount or automatic fallback; cleanup
-# deletes only resources it created (by UID). Needs bash, gh, kubectl, jq, yq.
+# Without --kubeconfig, kubectl uses its in-cluster service account (dispatch.sh).
+# No App key or automatic fallback; cleanup deletes only resources it created
+# (by UID). Needs bash, gh, kubectl, jq, yq, openssl.
 set -euo pipefail
 umask 077
 
@@ -115,8 +116,10 @@ fi
 # --- run mode ----------------------------------------------------------------
 
 for tool in gh kubectl; do need "$tool"; done
-[[ -n $ALLOWLIST && -n $REPO && -n $RUN_ID && -n $SHA && -n $KCFG && -n $CONTEXT ]] ||
-  die "run needs --allowlist --repo --run-id --sha --kubeconfig --context"
+[[ -n $ALLOWLIST && -n $REPO && -n $RUN_ID && -n $SHA ]] || die "run needs --allowlist --repo --run-id --sha"
+KARGS=()
+[[ -z $KCFG ]] || KARGS+=(--kubeconfig "$KCFG")
+[[ -z $CONTEXT ]] || KARGS+=(--context "$CONTEXT")
 [[ $RUN_ID =~ ^[0-9]+$ ]] || die "--run-id must be numeric"
 [[ $SHA =~ ^[0-9a-f]{40}$ ]] || die "--sha must be the full 40-hex head SHA"
 [[ $MINUTES =~ ^[1-9][0-9]*$ ]] || die "--minutes must be positive"
@@ -125,7 +128,7 @@ POLICY=$(yq -o=json ".repos[\"$REPO\"]" "$ALLOWLIST")
 PREFIX=$(jq -r '.label_prefix // "jit"' <<<"$POLICY")
 [[ $PREFIX =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || die "label_prefix must be short lowercase [a-z0-9-]"
 
-kc() { kubectl --kubeconfig "$KCFG" --context "$CONTEXT" --request-timeout=20s "$@"; }
+kc() { kubectl ${KARGS[@]+"${KARGS[@]}"} --request-timeout=20s "$@"; }
 
 # Approval check for the run; repeated while waiting and before registration.
 # Prints {run_attempt, status, conclusion}.
@@ -253,7 +256,7 @@ execute_job() {
   RUNNER_ID=$(printf '%s' "$reg" | jq -r .runner.id)
   # Never retry an interrupted attach with this credential.
   if ! printf '%s\n' "$reg" | jq -r .encoded_jit_config |
-      kubectl --kubeconfig "$KCFG" --context "$CONTEXT" --request-timeout=0 \
+      kubectl ${KARGS[@]+"${KARGS[@]}"} --request-timeout=0 \
         attach -i "$pod_name" -n "$NS" -c runner; then
     reg=
     die "$NODE attach failed; inspect cleanup before retrying"
@@ -315,6 +318,7 @@ while ((SECONDS < DEADLINE)); do
       | if ($mine | length) > 0 then
           if ($mine | all((.labels - $sup) | length == 0)) then "run" else "unsupported" end
         elif ($queued | length) > 0 and ($queued | all((.labels | index("self-hosted")) == null))
+             and (.jobs | all((.labels | index($label)) == null))
           then "hosted"
         else "wait" end')
   case $verdict in
