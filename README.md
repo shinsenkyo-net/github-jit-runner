@@ -2,7 +2,7 @@
 
 Disposable, one-job GitHub Actions runners on Kubernetes, each job in its own
 QEMU/KVM VM, started for a single allowlisted workflow run. No standing runner
-pool, no GitHub App, no inbound webhook and no privileged pod.
+pool, no inbound webhook and no privileged pod.
 
 | Path | What |
 |---|---|
