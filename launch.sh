@@ -116,6 +116,17 @@ fi
 # --- run mode ----------------------------------------------------------------
 
 for tool in gh kubectl; do need "$tool"; done
+# GH_TOKEN_COMMAND (optional) prints a current token before each gh call, for
+# short-lived GitHub App tokens (dispatch.sh token OWNER/NAME).
+gh() {
+  if [[ -n ${GH_TOKEN_COMMAND:-} ]]; then
+    local t
+    t=$($GH_TOKEN_COMMAND) || return 1
+    GH_TOKEN=$t command gh "$@"
+  else
+    command gh "$@"
+  fi
+}
 [[ -n $ALLOWLIST && -n $REPO && -n $RUN_ID && -n $SHA ]] || die "run needs --allowlist --repo --run-id --sha"
 KARGS=()
 [[ -z $KCFG ]] || KARGS+=(--kubeconfig "$KCFG")

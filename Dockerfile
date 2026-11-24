@@ -5,7 +5,7 @@ FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5
 ARG KUBECTL_VERSION=v1.36.2
 ARG KUBECTL_SHA256=1e9045ec32bea85da43de85f0065358529ea7c7a152eca78154fba5b58c27d82
 
-RUN apk add --no-cache bash ca-certificates github-cli jq openssl yq-go \
+RUN apk add --no-cache bash ca-certificates curl github-cli jq openssl yq-go \
  && wget -qO /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
  && echo "${KUBECTL_SHA256}  /usr/local/bin/kubectl" | sha256sum -c - \
  && chmod 0755 /usr/local/bin/kubectl \

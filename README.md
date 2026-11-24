@@ -8,7 +8,7 @@ pool, no GitHub App, no inbound webhook and no privileged pod.
 |---|---|
 | `vm/` | Runner image that runs each job in its own QEMU/KVM VM. The pod is non-root with no capabilities; Docker is privileged only inside the guest. Needs `/dev/kvm` (e.g. `squat.ai/kvm` from squat/generic-device-plugin). |
 | `launch.sh` | Operator-side launcher (bash, `gh`, `kubectl`, `jq`, `yq`): validates the run against an allowlist, creates one Job from a reviewed template, passes a single-job JIT registration over stdin, cleans up by UID. `launch.sh check` validates a template offline. |
-| `dispatch.sh` | Polls GitHub and runs `launch.sh` for each queued job that asks for the executor, one at a time. Runs in-cluster with one fine-grained token per repository owner and a service account limited to the runner namespace. |
+| `dispatch.sh` | Polls GitHub and runs `launch.sh` for each queued job that asks for the executor, one at a time. Runs in-cluster as a GitHub App (one-hour tokens, one repository each) with a service account limited to the runner namespace. |
 | `Dockerfile` | Dispatcher image: `dispatch.sh`, `launch.sh` and their tools. |
 | `test.sh` | Offline launcher checks. |
 | `examples/` | Executor profile, repository allowlist and a VM Job template. |
@@ -53,8 +53,8 @@ Pin by digest. Verify provenance with
 - A self-hosted runner executes whatever the run contains. With the
   dispatcher, anyone who can push to an allowlisted repository can run code
   there: allowlist only repositories whose writers you trust.
-- The dispatcher token needs Administration read/write (runner registration)
-  on its repositories: keep it limited to the allowlisted ones.
+- The dispatcher's GitHub App needs Administration read/write (runner
+  registration) and Actions read: install it only on the allowlisted repositories.
 - Fork runs are refused; public repositories are refused unless the allowlist
   says `public: true`.
 - Docker inside the job is privileged only within the guest kernel. Escaping
