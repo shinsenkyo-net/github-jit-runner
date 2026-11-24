@@ -80,6 +80,20 @@ done
   die "needs --executors --allowlist --executor --app DIR"
 [[ $INTERVAL =~ ^[1-9][0-9]*$ ]] || die "--interval must be positive"
 export GITHUB_APP_DIR=$APP
+# kubectl drops its in-cluster config once any flag (launch.sh: --request-timeout)
+# is set, so point it at the service account explicitly. The token stays in its file.
+sa=/var/run/secrets/kubernetes.io/serviceaccount
+if [[ -z ${KUBECONFIG:-} && -n ${KUBERNETES_SERVICE_HOST:-} && -r $sa/token ]]; then
+  export KUBECONFIG=${TMPDIR:-/tmp}/kubeconfig
+  cat >"$KUBECONFIG" <<EOF
+apiVersion: v1
+kind: Config
+clusters: [{name: in-cluster, cluster: {server: "https://$KUBERNETES_SERVICE_HOST:$KUBERNETES_SERVICE_PORT", certificate-authority: $sa/ca.crt}}]
+users: [{name: sa, user: {tokenFile: $sa/token}}]
+contexts: [{name: in-cluster, context: {cluster: in-cluster, user: sa}}]
+current-context: in-cluster
+EOF
+fi
 template=()
 [[ -z $TEMPLATE ]] || template=(--template "$TEMPLATE")
 
