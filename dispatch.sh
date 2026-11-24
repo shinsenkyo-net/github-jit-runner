@@ -3,7 +3,7 @@
 #
 #   ./dispatch.sh --executors EXECUTORS.yaml --allowlist REPOS.yaml --executor NAME \
 #     --app DIR [--template FILE] [--interval 20]
-#   ./dispatch.sh token OWNER/NAME   # print a token (launch.sh GH_TOKEN_COMMAND)
+#   ./dispatch.sh token OWNER/NAME   # print a token (launch.sh: GH_TOKEN_COMMAND=dispatch.sh)
 #
 # DIR holds a GitHub App's credentials: DIR/app-id and DIR/private-key. The App
 # needs repository permissions Administration read/write (runner registration)
@@ -89,11 +89,13 @@ NS=$(yq -r ".executors[\"$EXECUTOR\"].namespace" "$EXECUTORS")
 # is set, so point it at the service account explicitly. The token stays in its file.
 sa=/var/run/secrets/kubernetes.io/serviceaccount
 if [[ -z ${KUBECONFIG:-} && -n ${KUBERNETES_SERVICE_HOST:-} && -r $sa/token ]]; then
+  host=$KUBERNETES_SERVICE_HOST
+  [[ $host != *:* ]] || host="[$host]"   # IPv6 needs brackets in a URL
   export KUBECONFIG=${TMPDIR:-/tmp}/kubeconfig
   cat >"$KUBECONFIG" <<EOF
 apiVersion: v1
 kind: Config
-clusters: [{name: in-cluster, cluster: {server: "https://$KUBERNETES_SERVICE_HOST:$KUBERNETES_SERVICE_PORT", certificate-authority: $sa/ca.crt}}]
+clusters: [{name: in-cluster, cluster: {server: "https://$host:$KUBERNETES_SERVICE_PORT", certificate-authority: $sa/ca.crt}}]
 users: [{name: sa, user: {tokenFile: $sa/token}}]
 contexts: [{name: in-cluster, context: {cluster: in-cluster, user: sa}}]
 current-context: in-cluster
@@ -138,7 +140,7 @@ clear_stale_lock() {
 queued_runs() { # repo prefix
   local runs id attempt sha
   runs=$(for status in queued in_progress; do
-    gh api "repos/$1/actions/runs?status=$status&per_page=50" \
+    gh api --paginate "repos/$1/actions/runs?status=$status&per_page=100" \
       --jq '.workflow_runs[] | "\(.id) \(.run_attempt) \(.head_sha)"' || exit 1
   done) || return 1
   while read -r id attempt sha; do
@@ -170,7 +172,7 @@ while true; do
       tries=$(grep -cxF "$key" "$fails" || true)
       ((tries < 3)) || continue
       log "$repo run $id/$attempt ($sha): launching"
-      GH_TOKEN_COMMAND="$here/dispatch.sh token $repo" \
+      GH_TOKEN_COMMAND=$here/dispatch.sh \
         "$here/launch.sh" run --executors "$EXECUTORS" --allowlist "$ALLOWLIST" \
           --executor "$EXECUTOR" ${template[@]+"${template[@]}"} \
           --repo "$repo" --run-id "$id" --sha "$sha" </dev/null &

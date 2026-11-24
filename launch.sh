@@ -116,12 +116,12 @@ fi
 # --- run mode ----------------------------------------------------------------
 
 for tool in gh kubectl; do need "$tool"; done
-# GH_TOKEN_COMMAND (optional) prints a current token before each gh call, for
-# short-lived GitHub App tokens (dispatch.sh token OWNER/NAME).
+# GH_TOKEN_COMMAND (optional): a program run as `PROGRAM token OWNER/NAME` before
+# each gh call, printing a current token (short-lived GitHub App tokens; dispatch.sh).
 gh() {
   if [[ -n ${GH_TOKEN_COMMAND:-} ]]; then
     local t
-    t=$($GH_TOKEN_COMMAND) || return 1
+    t=$("$GH_TOKEN_COMMAND" token "$REPO") || return 1
     GH_TOKEN=$t command gh "$@"
   else
     command gh "$@"
