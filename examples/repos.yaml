@@ -8,11 +8,8 @@ repos:
       jit-macos-sdk: macos-sdk   # jit-macos-sdk-<run_id>-<attempt>: VM with Apple's macOS SDK
     workflows:
       - .github/workflows/ci.yml
-    publish:                     # optional: branch/tag/event-pinned workflows
-      - path: .github/workflows/publish.yml
+    publish:                     # optional: branch/event-pinned workflows
+      - path: .github/workflows/release.yml
         branches: [main]
         events: [push, workflow_dispatch]
-      - path: .github/workflows/release.yml
-        tags: ["v*"]             # tag pushes; the tagged commit must be on the default branch
-        events: [push]
     public: false

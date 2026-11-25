@@ -18,9 +18,8 @@ pool, no inbound webhook and no privileged pod.
 1. `dispatch.sh` sees a queued job with the run's label (or the operator
    picks a run and its full head SHA with `gh run list` and runs `launch.sh`).
 2. `launch.sh` checks: repository allowlisted, run from the same repository
-   (forks are refused), exact SHA, allowed workflow and event, branch/tag/event
-   rules for publishing workflows (a tag-pinned run must be a tag push whose
-   commit is on the default branch). It re-checks while waiting.
+   (forks are refused), exact SHA, allowed workflow and event, branch/event
+   rules for publishing workflows. It re-checks while waiting.
 3. It creates the Job from a template that must match the executor profile
    (node, namespace, no token, bounded `emptyDir` only, exact limits,
    non-root and unprivileged).
@@ -84,8 +83,7 @@ Pin by digest. Verify provenance with
   dispatcher, anyone who can push to an allowlisted repository can run code
   there: allowlist only repositories whose writers you trust.
 - The dispatcher's GitHub App needs Administration read/write (runner
-  registration), Actions read and, for tag-pinned publish rules, Contents read
-  (tag and default-branch checks): install it only on the allowlisted repositories.
+  registration) and Actions read: install it only on the allowlisted repositories.
 - Fork runs are refused; public repositories are refused unless the allowlist
   says `public: true`.
 - Docker inside the job is privileged only within the guest kernel. Escaping

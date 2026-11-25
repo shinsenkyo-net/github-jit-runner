@@ -173,20 +173,12 @@ kc() { kubectl ${KARGS[@]+"${KARGS[@]}"} --request-timeout=20s "$@"; }
 
 # Approval check for the run; repeated while waiting and before registration.
 # Prints {run_attempt, status, conclusion}.
-#
-# Publish rules pin a workflow to `branches` and/or `tags` (globs, `*` only)
-# and `events`. A run matched through `tags` must be a tag push whose tag points
-# at the approved SHA, and that commit must be on the default branch (checked
-# once per launch; the SHA itself is re-checked every time). The tag check
-# needs Contents: read.
 approve() {
-  local repo run verdict tag
+  local repo run
   repo=$(gh api "repos/$REPO") || return 1
   run=$(gh api "repos/$REPO/actions/runs/$RUN_ID") || return 1
-  verdict=$(jq -n --argjson repo "$repo" --argjson run "$run" --argjson policy "$POLICY" \
+  jq -n --argjson repo "$repo" --argjson run "$run" --argjson policy "$POLICY" \
         --arg name "$REPO" --arg sha "$SHA" '
-    def glob($g): ($g | gsub("(?<c>[.+?^${}()|\\[\\]\\\\])"; "\\\(.c)") | gsub("\\*"; ".*")) as $re
-      | test("^\($re)$");
     if $repo.visibility != "private" and ($policy.public // false) != true
       then error("public repository not approved for self-hosted runs")
     elif $run.head_repository.full_name != $name then error("fork workflow runs are not accepted")
@@ -195,36 +187,13 @@ approve() {
       then error("unsupported workflow event")
     else ([($policy.publish // [])[] | select(.path == $run.path)] | first) as $rule
       | if $rule != null then
-          if (($rule.events // []) | index($run.event)) == null
-            then error("publication run is outside its approved event")
-          elif (($rule.branches // []) | index($run.head_branch)) != null then {tag: null}
-          elif $run.event == "push" and ($run.head_branch // "" | test("^[A-Za-z0-9][A-Za-z0-9._-]*$"))
-               and any(($rule.tags // [])[]; . as $g | $run.head_branch | glob($g))
-            then {tag: $run.head_branch, default_branch: $repo.default_branch}
-          else error("publication run is outside its approved branch/tag") end
+          if ($rule.branches | index($run.head_branch)) == null or ($rule.events | index($run.event)) == null
+            then error("publication run is outside its approved branch/event") else . end
         elif (($policy.workflows // []) | index($run.path)) == null
           then error("workflow is not in the reviewed allowlist")
-        else {tag: null} end
-      | . + ($run | {run_attempt, status, conclusion})
-    end') || return 1
-  tag=$(jq -r '.tag // empty' <<<"$verdict")
-  if [[ -n $tag && $TAG_APPROVED != "$tag" ]]; then
-    tag_on_default "$tag" "$(jq -r .default_branch <<<"$verdict")" || return 1
-    TAG_APPROVED=$tag
-  fi
-  jq -c '{run_attempt, status, conclusion}' <<<"$verdict"
-}
-
-# The tag must point at the approved SHA, and the default branch must contain it.
-tag_on_default() { # tag default_branch
-  local commit status
-  commit=$(gh api "repos/$REPO/commits/refs/tags/$1" --jq .sha) ||
-    { echo "launch: cannot read tag $1 (the token needs Contents: read)" >&2; return 1; }
-  [[ $commit == "$SHA" ]] || { echo "launch: tag $1 points at $commit, not the approved SHA" >&2; return 1; }
-  status=$(gh api "repos/$REPO/compare/$SHA...$(jq -rn --arg b "$2" '$b | @uri')" --jq .status) ||
-    { echo "launch: cannot compare $SHA with $2" >&2; return 1; }
-  [[ $status == ahead || $status == identical ]] ||
-    { echo "launch: tagged commit is not on $2 (compare: $status)" >&2; return 1; }
+        else . end
+      | $run | {run_attempt, status, conclusion}
+    end'
 }
 
 # The run must still be the approved, unfinished attempt.
@@ -263,7 +232,7 @@ job_pod() { # prints the owned pod JSON, or nothing
 }
 
 OWNER=$(openssl rand -hex 12)
-JOB_UID= RUNNER_ID= LOCK_UID= ATTACH_PID= SAFE_TO_UNLOCK=true TAG_APPROVED=
+JOB_UID= RUNNER_ID= LOCK_UID= ATTACH_PID= SAFE_TO_UNLOCK=true
 
 # Delete this attempt's Job (and wait for its pod) and any leftover runner.
 cleanup_job() {

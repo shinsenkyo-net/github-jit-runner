@@ -6,12 +6,10 @@
 #   ./dispatch.sh token OWNER/NAME   # print a token (launch.sh: GH_TOKEN_COMMAND=dispatch.sh)
 #
 # DIR holds a GitHub App's credentials: DIR/app-id and DIR/private-key. The App
-# needs repository permissions Administration read/write (runner registration),
-# Actions read and Contents read (tag-pinned publish rules), and must be installed
-# on the allowlisted repositories. Every GitHub call uses a one-hour installation
-# token limited to one repository and those permissions, cached in $TMPDIR until
-# 15 minutes before it expires. Without Contents on the App, tokens fall back to
-# the first two and tag-pinned publish runs are refused.
+# needs repository permissions Administration read/write (runner registration)
+# and Actions read, and must be installed on the allowlisted repositories. Every
+# GitHub call uses a one-hour installation token limited to one repository and
+# those two permissions, cached in $TMPDIR until 15 minutes before it expires.
 #
 # A job is picked up when it is queued with the label <prefix>-<run_id>-<attempt>
 # in an allowlisted repository, where <prefix> is the repository's label_prefix
@@ -56,15 +54,10 @@ token() { # owner/name: print an installation token for that one repository
   fi
   # Explicit returns: callers use $(token ...) in conditions, where set -e is off.
   inst=$(app_call GET "/repos/$1/installation" | jq -er .id) || return 1
-  for perms in '{administration: "write", actions: "read", contents: "read"}' \
-               '{administration: "write", actions: "read"}'; do
-    body=$(jq -cn --arg r "${1#*/}" "{repositories: [\$r], permissions: $perms}") || return 1
-    if app_call POST "/app/installations/$inst/access_tokens" "$body" 2>/dev/null |
-         jq -er '(.expires_at | fromdateiso8601), .token' >"$cache.tmp"; then
-      break
-    fi
-    [[ $perms == *contents* ]] || return 1
-  done
+  body=$(jq -cn --arg r "${1#*/}" \
+    '{repositories: [$r], permissions: {administration: "write", actions: "read"}}') || return 1
+  app_call POST "/app/installations/$inst/access_tokens" "$body" |
+    jq -er '(.expires_at | fromdateiso8601), .token' >"$cache.tmp" || return 1
   mv "$cache.tmp" "$cache" || return 1
   sed -n 2p "$cache"
 }
