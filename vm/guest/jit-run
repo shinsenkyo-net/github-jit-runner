@@ -40,10 +40,19 @@ main() {
 
   export ACTIONS_RUNNER_INPUT_JITCONFIG \
     RUNNER_TOOL_CACHE=/opt/hostedtoolcache AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache
+  keep=ACTIONS_RUNNER_INPUT_JITCONFIG,RUNNER_TOOL_CACHE,AGENT_TOOLSDIRECTORY
+  # Image variants add job environment here (e.g. SDKROOT): NAME=value lines.
+  if [ -r /etc/jit-runner.env ]; then
+    while IFS='=' read -r name value; do
+      case $name in '' | '#'*) continue ;; esac
+      [[ $name =~ ^[A-Z_][A-Z0-9_]*$ ]] || { log "bad name in /etc/jit-runner.env: $name"; return 1; }
+      export "$name=$value"
+      keep=$keep,$name
+      log "job environment: $name=$value"
+    done </etc/jit-runner.env
+  fi
   cd /opt/runner
-  runuser -u runner \
-    -w ACTIONS_RUNNER_INPUT_JITCONFIG,RUNNER_TOOL_CACHE,AGENT_TOOLSDIRECTORY \
-    -- ./run.sh
+  runuser -u runner -w "$keep" -- ./run.sh
 }
 
 # Not `if (main)`: errexit is ignored inside a tested command, even a subshell.

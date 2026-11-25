@@ -6,10 +6,16 @@
 # or loop devices (mke2fs -d). The final image only holds QEMU, the disk and the
 # wrapper; it runs as a non-root user with no capabilities and needs only
 # /dev/kvm (e.g. from a device plugin) and a writable volume at /vm.
+#
+# VARIANT=base (default) or macos-sdk: the latter adds Apple's macOS SDK from
+# the newest Command Line Tools in Apple's public software update catalog
+# (macos-sdk/fetch.py) at /opt/macos-sdk, with SDKROOT set for jobs. Target
+# `macos-sdk-version` outputs only its VERSION file (publish.yml tags with it).
 
 ARG UBUNTU=ubuntu:24.04@sha256:224a1869083a311ef3f13648a154ba79832fbef6364d31493642ca03082da254
+ARG VARIANT=base
 
-FROM ${UBUNTU} AS guest
+FROM ${UBUNTU} AS guest-base
 ARG RUNNER_VERSION=2.337.0
 ARG RUNNER_SHA256=70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613
 ENV DEBIAN_FRONTEND=noninteractive
@@ -40,6 +46,26 @@ RUN chmod 755 /usr/local/sbin/jit-run \
     && systemctl mask serial-getty@ttyS0.service getty@tty1.service \
          systemd-firstboot.service apt-daily.timer apt-daily-upgrade.timer \
     && ls /boot/vmlinuz-* /boot/initrd.img-*
+
+FROM ${UBUNTU} AS macos-sdk
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 libarchive-tools ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY macos-sdk/fetch.py /usr/local/bin/macos-sdk-fetch
+# NMOS: the SDK of the macOS the tools were released with (27.2 for CLT 27.2).
+ARG MACOS_SDK_PACKAGE=CLTools_macOSNMOS_SDK.pkg
+RUN python3 -I /usr/local/bin/macos-sdk-fetch /out/macos-sdk "$MACOS_SDK_PACKAGE"
+
+FROM scratch AS macos-sdk-version
+COPY --from=macos-sdk /out/macos-sdk/VERSION /VERSION
+
+FROM guest-base AS guest-macos-sdk
+COPY --from=macos-sdk /out/macos-sdk/ /opt/macos-sdk/
+RUN echo SDKROOT=/opt/macos-sdk/MacOSX.sdk >/etc/jit-runner.env \
+    && test -f /opt/macos-sdk/MacOSX.sdk/SDKSettings.plist
+
+FROM guest-${VARIANT} AS guest
 
 FROM ${UBUNTU} AS disk
 ENV DEBIAN_FRONTEND=noninteractive
