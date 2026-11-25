@@ -3,11 +3,16 @@
 # Runs from forks are always refused; public repositories need `public: true`.
 repos:
   example-org/example-repo:
-    label_prefix: jit            # runs-on label: jit-<run_id>-<attempt>
+    label_prefix: jit            # runs-on label: jit-<run_id>-<attempt> (executor template)
+    variants:                    # optional: other runs-on prefixes -> executor image variants
+      jit-macos-sdk: macos-sdk   # jit-macos-sdk-<run_id>-<attempt>: VM with Apple's macOS SDK
     workflows:
       - .github/workflows/ci.yml
-    publish:                     # optional: branch/event-pinned workflows
-      - path: .github/workflows/release.yml
+    publish:                     # optional: branch/tag/event-pinned workflows
+      - path: .github/workflows/publish.yml
         branches: [main]
         events: [push, workflow_dispatch]
+      - path: .github/workflows/release.yml
+        tags: ["v*"]             # tag pushes; the tagged commit must be on the default branch
+        events: [push]
     public: false

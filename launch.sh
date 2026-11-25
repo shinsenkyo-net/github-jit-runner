@@ -4,10 +4,18 @@
 #   ./launch.sh run \
 #     --executors EXECUTORS.yaml --allowlist REPOS.yaml --executor NAME \
 #     --repo OWNER/NAME --run-id ID --sha FULL_HEAD_SHA \
-#     [--kubeconfig KUBECONFIG --context CONTEXT] [--minutes 90] [--runner-image IMG@sha256:...]
+#     [--label-prefix PREFIX] [--template-dir DIR] [--kubeconfig KUBECONFIG --context CONTEXT]
+#     [--minutes 90] [--runner-image IMG@sha256:...]
 #
-#   ./launch.sh check --executors EXECUTORS.yaml --executor NAME [--template FILE]
+#   ./launch.sh check --executors EXECUTORS.yaml --executor NAME [--variant NAME] [--template FILE]
 #     Offline: validate a Job template against its executor profile, print the Job.
+#
+# Image variants: an executor may list `variants: {NAME: TEMPLATE}`, other Job
+# templates (other pinned images) under the same profile. A repository maps
+# runs-on prefixes to them with `variants: {PREFIX: NAME}`; its `label_prefix`
+# (default jit) uses the executor's `template`. --label-prefix picks which one
+# this launch serves. --template-dir DIR looks templates up by file name in DIR
+# (a mounted ConfigMap) instead of relative to EXECUTORS.yaml.
 #
 # The operator approves one run (id + full head SHA). The launcher re-validates
 # it against the allowlist, creates one Job from a reviewed template, waits for
@@ -29,12 +37,14 @@ need() { command -v "$1" >/dev/null || die "missing tool: $1"; }
 mode=${1:-}; shift || true
 [[ $mode == run || $mode == check ]] || die "usage: launch.sh run|check ... (see header)"
 EXECUTORS= ALLOWLIST= EXECUTOR= REPO= RUN_ID= SHA= MINUTES=90 KCFG= CONTEXT= IMAGE= TEMPLATE=
+LABEL_PREFIX= VARIANT= TEMPLATE_DIR=
 while (($#)); do
   case $1 in
     --executors) EXECUTORS=$2 ;; --allowlist) ALLOWLIST=$2 ;; --executor) EXECUTOR=$2 ;;
     --repo) REPO=$2 ;; --run-id) RUN_ID=$2 ;; --sha) SHA=$2 ;; --minutes) MINUTES=$2 ;;
     --kubeconfig) KCFG=$2 ;; --context) CONTEXT=$2 ;; --runner-image) IMAGE=$2 ;;
-    --template) TEMPLATE=$2 ;;
+    --template) TEMPLATE=$2 ;; --template-dir) TEMPLATE_DIR=$2 ;;
+    --label-prefix) LABEL_PREFIX=$2 ;; --variant) VARIANT=$2 ;;
     *) die "unknown argument: $1" ;;
   esac
   shift 2
@@ -51,7 +61,31 @@ for key in node namespace template pod_policy binding_policy tolerations dns_pol
 done
 NODE=$(jq -r .node <<<"$PROFILE")
 NS=$(jq -r .namespace <<<"$PROFILE")
-[[ -n $TEMPLATE ]] || TEMPLATE="$(dirname "$EXECUTORS")/$(jq -r .template <<<"$PROFILE")"
+
+# Run mode: the repository policy decides the runs-on prefix and image variant.
+if [[ $mode == run ]]; then
+  [[ -n $ALLOWLIST && -n $REPO ]] || die "run needs --allowlist --repo --run-id --sha"
+  [[ -z $VARIANT ]] || die "--variant is for check mode; run mode takes --label-prefix"
+  POLICY=$(yq -o=json ".repos[\"$REPO\"]" "$ALLOWLIST")
+  [[ $POLICY != null ]] || die "$REPO is not in the reviewed allowlist"
+  PREFIX=$(jq -r '.label_prefix // "jit"' <<<"$POLICY")
+  if [[ -n $LABEL_PREFIX && $LABEL_PREFIX != "$PREFIX" ]]; then
+    VARIANT=$(jq -r --arg p "$LABEL_PREFIX" '.variants[$p] // empty' <<<"$POLICY")
+    [[ -n $VARIANT ]] || die "$REPO has no runs-on prefix $LABEL_PREFIX"
+    PREFIX=$LABEL_PREFIX
+  fi
+  [[ $PREFIX =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || die "label prefixes must be short lowercase [a-z0-9-]"
+fi
+if [[ -n $VARIANT ]]; then
+  rel=$(jq -r --arg v "$VARIANT" '.variants[$v] // empty' <<<"$PROFILE")
+  [[ -n $rel ]] || die "executor $EXECUTOR has no image variant $VARIANT"
+else
+  rel=$(jq -r .template <<<"$PROFILE")
+fi
+if [[ -z $TEMPLATE ]]; then
+  if [[ -n $TEMPLATE_DIR ]]; then TEMPLATE="$TEMPLATE_DIR/$(basename "$rel")"
+  else TEMPLATE="$(dirname "$EXECUTORS")/$rel"; fi
+fi
 TEMPLATE_JSON=$(yq -o=json "$TEMPLATE")
 [[ -n $IMAGE ]] || IMAGE=$(jq -r '.spec.template.spec.containers[0].image' <<<"$TEMPLATE_JSON")
 
@@ -127,28 +161,32 @@ gh() {
     command gh "$@"
   fi
 }
-[[ -n $ALLOWLIST && -n $REPO && -n $RUN_ID && -n $SHA ]] || die "run needs --allowlist --repo --run-id --sha"
+[[ -n $RUN_ID && -n $SHA ]] || die "run needs --allowlist --repo --run-id --sha"
 KARGS=()
 [[ -z $KCFG ]] || KARGS+=(--kubeconfig "$KCFG")
 [[ -z $CONTEXT ]] || KARGS+=(--context "$CONTEXT")
 [[ $RUN_ID =~ ^[0-9]+$ ]] || die "--run-id must be numeric"
 [[ $SHA =~ ^[0-9a-f]{40}$ ]] || die "--sha must be the full 40-hex head SHA"
 [[ $MINUTES =~ ^[1-9][0-9]*$ ]] || die "--minutes must be positive"
-POLICY=$(yq -o=json ".repos[\"$REPO\"]" "$ALLOWLIST")
-[[ $POLICY != null ]] || die "$REPO is not in the reviewed allowlist"
-PREFIX=$(jq -r '.label_prefix // "jit"' <<<"$POLICY")
-[[ $PREFIX =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || die "label_prefix must be short lowercase [a-z0-9-]"
 
 kc() { kubectl ${KARGS[@]+"${KARGS[@]}"} --request-timeout=20s "$@"; }
 
 # Approval check for the run; repeated while waiting and before registration.
 # Prints {run_attempt, status, conclusion}.
+#
+# Publish rules pin a workflow to `branches` and/or `tags` (globs, `*` only)
+# and `events`. A run matched through `tags` must be a tag push whose tag points
+# at the approved SHA, and that commit must be on the default branch (checked
+# once per launch; the SHA itself is re-checked every time). The tag check
+# needs Contents: read.
 approve() {
-  local repo run
+  local repo run verdict tag
   repo=$(gh api "repos/$REPO") || return 1
   run=$(gh api "repos/$REPO/actions/runs/$RUN_ID") || return 1
-  jq -n --argjson repo "$repo" --argjson run "$run" --argjson policy "$POLICY" \
+  verdict=$(jq -n --argjson repo "$repo" --argjson run "$run" --argjson policy "$POLICY" \
         --arg name "$REPO" --arg sha "$SHA" '
+    def glob($g): ($g | gsub("(?<c>[.+?^${}()|\\[\\]\\\\])"; "\\\(.c)") | gsub("\\*"; ".*")) as $re
+      | test("^\($re)$");
     if $repo.visibility != "private" and ($policy.public // false) != true
       then error("public repository not approved for self-hosted runs")
     elif $run.head_repository.full_name != $name then error("fork workflow runs are not accepted")
@@ -157,13 +195,36 @@ approve() {
       then error("unsupported workflow event")
     else ([($policy.publish // [])[] | select(.path == $run.path)] | first) as $rule
       | if $rule != null then
-          if ($rule.branches | index($run.head_branch)) == null or ($rule.events | index($run.event)) == null
-            then error("publication run is outside its approved branch/event") else . end
+          if (($rule.events // []) | index($run.event)) == null
+            then error("publication run is outside its approved event")
+          elif (($rule.branches // []) | index($run.head_branch)) != null then {tag: null}
+          elif $run.event == "push" and ($run.head_branch // "" | test("^[A-Za-z0-9][A-Za-z0-9._-]*$"))
+               and any(($rule.tags // [])[]; . as $g | $run.head_branch | glob($g))
+            then {tag: $run.head_branch, default_branch: $repo.default_branch}
+          else error("publication run is outside its approved branch/tag") end
         elif (($policy.workflows // []) | index($run.path)) == null
           then error("workflow is not in the reviewed allowlist")
-        else . end
-      | $run | {run_attempt, status, conclusion}
-    end'
+        else {tag: null} end
+      | . + ($run | {run_attempt, status, conclusion})
+    end') || return 1
+  tag=$(jq -r '.tag // empty' <<<"$verdict")
+  if [[ -n $tag && $TAG_APPROVED != "$tag" ]]; then
+    tag_on_default "$tag" "$(jq -r .default_branch <<<"$verdict")" || return 1
+    TAG_APPROVED=$tag
+  fi
+  jq -c '{run_attempt, status, conclusion}' <<<"$verdict"
+}
+
+# The tag must point at the approved SHA, and the default branch must contain it.
+tag_on_default() { # tag default_branch
+  local commit status
+  commit=$(gh api "repos/$REPO/commits/refs/tags/$1" --jq .sha) ||
+    { echo "launch: cannot read tag $1 (the token needs Contents: read)" >&2; return 1; }
+  [[ $commit == "$SHA" ]] || { echo "launch: tag $1 points at $commit, not the approved SHA" >&2; return 1; }
+  status=$(gh api "repos/$REPO/compare/$SHA...$(jq -rn --arg b "$2" '$b | @uri')" --jq .status) ||
+    { echo "launch: cannot compare $SHA with $2" >&2; return 1; }
+  [[ $status == ahead || $status == identical ]] ||
+    { echo "launch: tagged commit is not on $2 (compare: $status)" >&2; return 1; }
 }
 
 # The run must still be the approved, unfinished attempt.
@@ -202,7 +263,7 @@ job_pod() { # prints the owned pod JSON, or nothing
 }
 
 OWNER=$(openssl rand -hex 12)
-JOB_UID= RUNNER_ID= LOCK_UID= ATTACH_PID= SAFE_TO_UNLOCK=true
+JOB_UID= RUNNER_ID= LOCK_UID= ATTACH_PID= SAFE_TO_UNLOCK=true TAG_APPROVED=
 
 # Delete this attempt's Job (and wait for its pod) and any leftover runner.
 cleanup_job() {

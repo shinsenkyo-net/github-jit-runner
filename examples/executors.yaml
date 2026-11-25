@@ -6,6 +6,8 @@ executors:
     node: worker-1                       # kubernetes.io/hostname
     namespace: github-runners
     template: job-vm.yaml
+    variants:                            # optional: same profile, other pinned images
+      macos-sdk: job-vm-macos-sdk.yaml
     pod_policy: github-jit-pods          # ValidatingAdmissionPolicy names that
     binding_policy: github-jit-bindings  # must exist (checked in preflight)
     tolerations: []

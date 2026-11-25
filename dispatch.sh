@@ -2,17 +2,22 @@
 # Poll GitHub and run launch.sh for every queued job that asks for this executor.
 #
 #   ./dispatch.sh --executors EXECUTORS.yaml --allowlist REPOS.yaml --executor NAME \
-#     --app DIR [--template FILE] [--interval 20]
+#     --app DIR [--template-dir DIR] [--interval 20]
 #   ./dispatch.sh token OWNER/NAME   # print a token (launch.sh: GH_TOKEN_COMMAND=dispatch.sh)
 #
 # DIR holds a GitHub App's credentials: DIR/app-id and DIR/private-key. The App
-# needs repository permissions Administration read/write (runner registration)
-# and Actions read, and must be installed on the allowlisted repositories. Every
-# GitHub call uses a one-hour installation token limited to one repository and
-# those two permissions, cached in $TMPDIR until 15 minutes before it expires.
+# needs repository permissions Administration read/write (runner registration),
+# Actions read and Contents read (tag-pinned publish rules), and must be installed
+# on the allowlisted repositories. Every GitHub call uses a one-hour installation
+# token limited to one repository and those permissions, cached in $TMPDIR until
+# 15 minutes before it expires. Without Contents on the App, tokens fall back to
+# the first two and tag-pinned publish runs are refused.
 #
-# A job is picked up when it is queued with the label <label_prefix>-<run_id>-<attempt>
-# in an allowlisted repository; launch.sh then applies every check (private repo,
+# A job is picked up when it is queued with the label <prefix>-<run_id>-<attempt>
+# in an allowlisted repository, where <prefix> is the repository's label_prefix
+# (default jit; the executor's template) or one of its `variants` prefixes (that
+# image variant's template). --template-dir DIR finds the templates by file name
+# in DIR (a mounted ConfigMap). launch.sh then applies every check (private repo,
 # same-repo head, allowlisted workflow, SHA). One run at a time. A failed launch is
 # retried on later polls while its job is still queued, at most 3 times per
 # run/attempt. A lock left by an earlier launch of this dispatcher (crash, kill)
@@ -51,10 +56,15 @@ token() { # owner/name: print an installation token for that one repository
   fi
   # Explicit returns: callers use $(token ...) in conditions, where set -e is off.
   inst=$(app_call GET "/repos/$1/installation" | jq -er .id) || return 1
-  body=$(jq -cn --arg r "${1#*/}" \
-    '{repositories: [$r], permissions: {administration: "write", actions: "read"}}') || return 1
-  app_call POST "/app/installations/$inst/access_tokens" "$body" |
-    jq -er '(.expires_at | fromdateiso8601), .token' >"$cache.tmp" || return 1
+  for perms in '{administration: "write", actions: "read", contents: "read"}' \
+               '{administration: "write", actions: "read"}'; do
+    body=$(jq -cn --arg r "${1#*/}" "{repositories: [\$r], permissions: $perms}") || return 1
+    if app_call POST "/app/installations/$inst/access_tokens" "$body" 2>/dev/null |
+         jq -er '(.expires_at | fromdateiso8601), .token' >"$cache.tmp"; then
+      break
+    fi
+    [[ $perms == *contents* ]] || return 1
+  done
   mv "$cache.tmp" "$cache" || return 1
   sed -n 2p "$cache"
 }
@@ -69,11 +79,11 @@ fi
 # --- dispatcher ----------------------------------------------------------------
 
 here=$(cd "$(dirname "$0")" && pwd)
-EXECUTORS= ALLOWLIST= EXECUTOR= APP= TEMPLATE= INTERVAL=20
+EXECUTORS= ALLOWLIST= EXECUTOR= APP= TEMPLATE_DIR= INTERVAL=20
 while (($#)); do
   case $1 in
     --executors) EXECUTORS=$2 ;; --allowlist) ALLOWLIST=$2 ;; --executor) EXECUTOR=$2 ;;
-    --app) APP=$2 ;; --template) TEMPLATE=$2 ;; --interval) INTERVAL=$2 ;;
+    --app) APP=$2 ;; --template-dir) TEMPLATE_DIR=$2 ;; --interval) INTERVAL=$2 ;;
     *) die "unknown argument: $1" ;;
   esac
   shift 2
@@ -102,7 +112,7 @@ current-context: in-cluster
 EOF
 fi
 template=()
-[[ -z $TEMPLATE ]] || template=(--template "$TEMPLATE")
+[[ -z $TEMPLATE_DIR ]] || template=(--template-dir "$TEMPLATE_DIR")
 
 seen=$(mktemp)         # repos already reported as having no token
 fails=$(mktemp)        # one line per failed launch: owner/name/run/attempt
@@ -136,18 +146,22 @@ clear_stale_lock() {
   log "cleared a stale lock (run $(jq -r .data.run <<<"$lock"), holder $holder)"
 }
 
-# Prints "<run_id> <attempt> <sha>" for runs of $repo with a queued job labelled for us.
-queued_runs() { # repo prefix
-  local runs id attempt sha
+# Prints "<run_id> <attempt> <sha> <prefix>" for runs of $repo with a queued job
+# labelled with one of the prefixes (one line per prefix found).
+queued_runs() { # repo prefix...
+  local repo=$1 runs id attempt sha labels
+  shift
   runs=$(for status in queued in_progress; do
-    gh api --paginate "repos/$1/actions/runs?status=$status&per_page=100" \
+    gh api --paginate "repos/$repo/actions/runs?status=$status&per_page=100" \
       --jq '.workflow_runs[] | "\(.id) \(.run_attempt) \(.head_sha)"' || exit 1
   done) || return 1
   while read -r id attempt sha; do
     [[ -n $id ]] || continue
-    gh api "repos/$1/actions/runs/$id/attempts/$attempt/jobs?per_page=100" \
-      --jq "any(.jobs[]; .status == \"queued\" and (.labels | index(\"$2-$id-$attempt\")))" |
-      grep -qx true && echo "$id $attempt $sha"
+    labels=$(gh api "repos/$repo/actions/runs/$id/attempts/$attempt/jobs?per_page=100" \
+      --jq '.jobs[] | select(.status == "queued") | .labels[]') || return 1
+    for prefix in "$@"; do
+      grep -qxF "$prefix-$id-$attempt" <<<"$labels" && echo "$id $attempt $sha $prefix"
+    done
   done <<<"$runs"
   return 0
 }
@@ -156,25 +170,26 @@ log "dispatching for executor $EXECUTOR every ${INTERVAL}s"
 clear_stale_lock || true
 while true; do
   for repo in $(yq -r '.repos | keys | .[]' "$ALLOWLIST"); do
-    prefix=$(yq -r ".repos[\"$repo\"].label_prefix // \"jit\"" "$ALLOWLIST")
+    prefixes=$(yq -r ".repos[\"$repo\"] | [.label_prefix // \"jit\"] + ((.variants // {}) | keys) | .[]" "$ALLOWLIST")
     if ! GH_TOKEN=$(token "$repo" 2>/dev/null); then
       if once "no-token/$repo"; then log "$repo: no App token (App not installed there, or not ready)"; fi
       continue
     fi
     export GH_TOKEN
-    if ! found=$(queued_runs "$repo" "$prefix"); then
+    # shellcheck disable=SC2086 # prefixes are [a-z0-9-] (launch.sh checks)
+    if ! found=$(queued_runs "$repo" $prefixes); then
       log "$repo: GitHub poll failed"
       continue
     fi
-    while read -r id attempt sha; do
+    while read -r id attempt sha prefix; do
       [[ -n $id ]] || continue
-      key=$repo/$id/$attempt
+      key=$repo/$id/$attempt/$prefix
       tries=$(grep -cxF "$key" "$fails" || true)
       ((tries < 3)) || continue
-      log "$repo run $id/$attempt ($sha): launching"
+      log "$repo run $id/$attempt ($sha, $prefix): launching"
       GH_TOKEN_COMMAND=$here/dispatch.sh \
         "$here/launch.sh" run --executors "$EXECUTORS" --allowlist "$ALLOWLIST" \
-          --executor "$EXECUTOR" ${template[@]+"${template[@]}"} \
+          --executor "$EXECUTOR" ${template[@]+"${template[@]}"} --label-prefix "$prefix" \
           --repo "$repo" --run-id "$id" --sha "$sha" </dev/null &
       child=$!
       code=0; wait "$child" || code=$?
