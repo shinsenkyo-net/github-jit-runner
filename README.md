@@ -45,6 +45,10 @@ SDK variant, for example:
 runs-on: [self-hosted, Linux, X64, "jit-macos-sdk-${{ github.run_id }}-${{ github.run_attempt }}"]
 ```
 
+Both images include `build-essential` (gcc, g++, make), so Rust build scripts and
+C dependencies build without extra setup; language toolchains (Rust, zig, ...)
+are the workflow's to install.
+
 That job still runs on Linux; the VM has the SDK at `/opt/macos-sdk` and
 `SDKROOT` set, for cross-linking macOS binaries (e.g. zig, cargo-zigbuild).
 One dispatcher serves every prefix of its executor, one run at a time: a

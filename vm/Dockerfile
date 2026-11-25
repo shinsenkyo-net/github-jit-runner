@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       linux-image-virtual initramfs-tools systemd systemd-sysv udev dbus \
       iproute2 e2fsprogs util-linux kmod \
       ca-certificates curl docker.io docker-buildx git iptables jq sudo tar unzip xz-utils \
+      build-essential \
       libicu74 \
     && useradd --create-home --shell /bin/bash runner \
     && usermod -aG docker runner \
